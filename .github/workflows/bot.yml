@@ -1,0 +1,66 @@
+name: Scheduled posts (prices + daily calendar)
+
+on:
+  schedule:
+    # Tehran 07:00 / 12:00 / 17:00 = UTC 03:30 / 08:30 / 13:30.
+    # The job starts 8 minutes early (GitHub can delay scheduled runs); the script waits for the exact minute.
+    - cron: "22 3 * * *"
+    - cron: "22 8 * * *"
+    - cron: "22 13 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "diagnose (test sources, post nothing) | dry (print messages, post nothing) | run (post for real)"
+        default: "diagnose"
+      slot:
+        description: "now | 7 | 12 | 17   (the daily calendar is posted only for 7 and now)"
+        default: "now"
+
+permissions:
+  contents: write   # lets the job save state/state.json; these commits also keep the repository "active"
+
+concurrency:
+  group: scheduled-posts
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          WALLGOLD_URL: ${{ secrets.WALLGOLD_URL }}
+          BRSAPI_KEY: ${{ secrets.BRSAPI_KEY }}
+          PRICE_SOURCES: ${{ vars.PRICE_SOURCES }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_SLOT: ${{ github.event.inputs.slot }}
+        run: |
+          SLOT="${INPUT_SLOT:-auto}"
+          case "${INPUT_MODE:-run}" in
+            diagnose) python bot.py --diagnose ;;
+            dry)      python bot.py --dry-run --slot "$SLOT" ;;
+            *)        python bot.py --slot "$SLOT" ;;
+          esac
+
+      - name: Save state
+        if: always()
+        run: |
+          if [ -d state ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state/state.json 2>/dev/null || true
+            git diff --cached --quiet || (git commit -m "state update" && git push)
+          fi
