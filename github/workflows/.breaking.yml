@@ -1,0 +1,52 @@
+name: Breaking news check
+
+on:
+  schedule:
+    # every 10 minutes, at odd minutes (GitHub is less congested than at :00 / :30)
+    - cron: "7,17,27,37,47,57 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check (post for real) | dry (print only, post nothing)"
+        default: "dry"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: breaking-news
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # remembers which stories were already seen, so nothing is posted twice
+      - uses: actions/cache@v4
+        with:
+          path: state/breaking_seen.json
+          key: breaking-${{ github.run_id }}
+          restore-keys: breaking-
+
+      - name: Check feeds
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+        run: |
+          if [ "${INPUT_MODE:-check}" = "dry" ]; then
+            python bot.py --mode breaking --dry-run
+          else
+            python bot.py --mode breaking
+          fi
