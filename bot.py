@@ -44,7 +44,7 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 OWNER_ID = os.getenv("OWNER_ID", "")
 BRSAPI_KEY = os.getenv("BRSAPI_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL") or "claude-haiku-5-5"
 
 CRYPTO_FEEDS = [u for u in os.getenv("NEWS_FEEDS_CRYPTO", "").split(",") if u.strip()] or [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -295,7 +295,7 @@ def wallgold_gold18(ref_toman):
 
 
 def collect_prices():
-    order = [x.strip().lower() for x in os.getenv("PRICE_SOURCES", "wallex,wallgold,brs,tetherland,tgju").split(",") if x.strip()]
+    order = [x.strip().lower() for x in (os.getenv("PRICE_SOURCES") or "wallex,wallgold,brs,tetherland,tgju").split(",") if x.strip()]
     cache = {}
 
     def brs():
@@ -530,13 +530,16 @@ def build_calendar_message(now, hours=24, events=None):
 
 
 # ----------------------------------------------------------------------------- breaking news (strict)
-MAJOR = re.compile(r"\b(bitcoin|btc|ethereum|ether|binance|coinbase|tether|usdt|usdc|kraken|okx|bybit|bitfinex|kucoin|circle|blackrock|fed|ecb)\b", re.I)
+# victims / actors that make a story truly market-moving
+TOP_ENTITIES = re.compile(r"\b(binance|coinbase|kraken|okx|bybit|kucoin|bitfinex|bitstamp|gemini|tether|usdt|circle|usdc|blackrock|grayscale)\b", re.I)
+STABLE_MAJOR = re.compile(r"\b(tether|usdt|usdc|circle|dai|usde)\b", re.I)
 AMOUNT = re.compile(r"\$\s?(\d+(?:\.\d+)?)\s?(m|million|b|billion)\b", re.I)
-NOT_NEWS = re.compile(r"^(how|why|what|guide|opinion|analysis|explained|tips|should|could|will)\b|\?", re.I)
+FOLLOW_UP = re.compile(r"\b(returns?|returned|recover(s|ed|y)?|sentenced|settles?|aftermath|council|dao|proposal|vote[sd]?|moved|moves|funds? (from|of|tied)|(hack|hacked|stolen) funds|years? (after|since)|previous|last (year|month|week)|anniversary|report(s|ed)? (on|says))\b", re.I)
+NOT_NEWS = re.compile(r"^(how|why|what|guide|opinion|analysis|explained|tips|should|could|will|is|are|can)\b|\?|\b(price prediction|forecast|technical analysis)\b", re.I)
 BR_SECURITY = re.compile(r"\b(hack(ed|s)?|exploit(ed|s)?|drain(ed|s)?|stolen|breach(ed)?|rug ?pull)\b", re.I)
 BR_COLLAPSE = re.compile(r"bankrupt|insolven|(halts?|suspends?|freezes?) (all )?(withdrawals|trading|deposits)", re.I)
 BR_DEPEG = re.compile(r"de-?peg", re.I)
-BR_MACRO = re.compile(r"emergency (rate|meeting)|surprise (rate|cut|hike)|intervene[sd]?|currency intervention|sovereign default|bank run|trading halt|circuit breaker", re.I)
+BR_MACRO = re.compile(r"emergency (rate|meeting|cut)|surprise (rate )?(cut|hike)|currency intervention|sovereign default|circuit breaker", re.I)
 BR_REG = re.compile(r"(approves?|approved) .{0,40}(bitcoin|ethereum|spot).{0,20}ETF|SEC (sues|charges) (binance|coinbase|kraken|tether)|(arrests?|arrested) .{0,30}(CEO|founder)", re.I)
 
 
@@ -549,19 +552,20 @@ def amount_musd(text):
 
 
 def breaking_label(item):
-    t = f"{item['title']} {item['desc']}"
-    if NOT_NEWS.search(item["title"].strip()):
+    title = item["title"].strip()
+    if NOT_NEWS.search(title) or FOLLOW_UP.search(title):
         return None
-    major = bool(MAJOR.search(t))
-    if BR_SECURITY.search(t) and (amount_musd(t) >= 20 or major):
+    top = bool(TOP_ENTITIES.search(title))
+    big = amount_musd(f"{title} {item['desc']}") >= 100  # $100M or more
+    if BR_SECURITY.search(title) and (top or big):
         return "🚨 هک / امنیتی"
-    if BR_COLLAPSE.search(t) and major:
+    if BR_COLLAPSE.search(title) and top:
         return "🚨 ورشکستگی / توقف برداشت"
-    if BR_DEPEG.search(t) and major:
+    if BR_DEPEG.search(title) and STABLE_MAJOR.search(title):
         return "🚨 از دست رفتن پگ استیبل‌کوین"
-    if BR_MACRO.search(t):
+    if BR_MACRO.search(title):
         return "🏦 رویداد اضطراری بازار / بانک مرکزی"
-    if BR_REG.search(t):
+    if BR_REG.search(title) and (top or "etf" in title.lower()):
         return "⚖️ تصمیم مهم نظارتی"
     return None
 
@@ -748,7 +752,10 @@ def diagnose():
     items = []
     for u in CRYPTO_FEEDS + FOREX_FEEDS:
         items += parse_feed(u, datetime.now(timezone.utc) - timedelta(hours=24))
-    print(f"RESULT news: {len(items)} items in last 24h, {len([i for i in items if breaking_label(i)])} look like breaking news")
+    hits = [i for i in items if breaking_label(i)]
+    print(f"RESULT news: {len(items)} items in last 24h, {len(hits)} look like breaking news")
+    for i in hits[:10]:
+        print(f"RESULT   breaking? [{i['src']}] {i['title'][:110]}")
     if BOT_TOKEN:
         r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=20)
         print("RESULT telegram getMe:", "OK" if r.ok else f"FAILED {r.status_code}")
