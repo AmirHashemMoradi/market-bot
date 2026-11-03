@@ -534,7 +534,7 @@ def build_calendar_message(now, hours=24, events=None):
 TOP_ENTITIES = re.compile(r"\b(binance|coinbase|kraken|okx|bybit|kucoin|bitfinex|bitstamp|gemini|tether|usdt|circle|usdc|blackrock|grayscale)\b", re.I)
 STABLE_MAJOR = re.compile(r"\b(tether|usdt|usdc|circle|dai|usde)\b", re.I)
 AMOUNT = re.compile(r"\$\s?(\d+(?:\.\d+)?)\s?(m|million|b|billion)\b", re.I)
-FOLLOW_UP = re.compile(r"\b(returns?|returned|recover(s|ed|y)?|sentenced|settles?|aftermath|council|dao|proposal|vote[sd]?|moved|moves|funds? (from|of|tied)|(hack|hacked|stolen) funds|years? (after|since)|previous|last (year|month|week)|anniversary|report(s|ed)? (on|says))\b", re.I)
+FOLLOW_UP = re.compile(r"\b(returns?|returned|recover(s|ed|y)?|sentenced|settles?|aftermath|council|dao|proposal|vote[sd]?|moved|moves|funds? (from|of|tied)|(hack|hacked|stolen) funds|years? (after|since)|previous|last (year|month|week)|anniversary|report(s|ed)? (on|says)|(days?|weeks?|months?) (after|since|later)|denies|points? finger|launder(s|ed|ing)?|investigat\w*|fbi|probe|outflows?|inflows?|bullish|bearish|urges?|flags?|swap(s|ping)?|tracks?|traces?|suspects?|blames?|links?)\b", re.I)
 NOT_NEWS = re.compile(r"^(how|why|what|guide|opinion|analysis|explained|tips|should|could|will|is|are|can)\b|\?|\b(price prediction|forecast|technical analysis)\b", re.I)
 BR_SECURITY = re.compile(r"\b(hack(ed|s)?|exploit(ed|s)?|drain(ed|s)?|stolen|breach(ed)?|rug ?pull)\b", re.I)
 BR_COLLAPSE = re.compile(r"bankrupt|insolven|(halts?|suspends?|freezes?) (all )?(withdrawals|trading|deposits)", re.I)
@@ -549,6 +549,11 @@ def amount_musd(text):
         v = float(m.group(1)) * (1000 if m.group(2).lower() in ("b", "billion") else 1)
         best = max(best, v)
     return best
+
+
+def breaking_topic(item, label):
+    m = TOP_ENTITIES.search(item["title"])
+    return f"{label}|{m.group(1).lower()}" if m else ""
 
 
 def breaking_label(item):
@@ -666,40 +671,50 @@ def run_breaking(dry=False):
     items = []
     for u in CRYPTO_FEEDS + FOREX_FEEDS:
         items += parse_feed(u, cutoff)
+    cooldown = {x["topic"] for x in seen if x.get("topic") and now_utc.timestamp() - x["t"] < 24 * 3600}
     cands = []
     for it in sorted(items, key=lambda x: -x["dt"].timestamp()):
         lab = breaking_label(it)
         if not lab:
             continue
+        topic = breaking_topic(it, lab)
+        if topic and (topic in cooldown or any(c[2] == topic for c in cands)):
+            continue  # same ongoing story (e.g. another angle on one exchange hack) — already covered
         if any(same_story(it["title"], x["title"]) for x in seen) or any(same_story(it["title"], c[0]["title"]) for c in cands):
             continue
-        cands.append((it, lab))
+        cands.append((it, lab, topic))
     print(f"breaking: {len(items)} recent items, {len(cands)} new candidates")
     if not cands:
         return 0
 
     chosen = []
+    evaluated = None  # candidates that were actually judged (so they are not judged again)
     if ANTHROPIC_KEY:
         try:
             rated = llm_rate([c[0] for c in cands[:8]])
-            for i, (it, lab) in enumerate(cands[:8]):
+            evaluated = cands[:8]
+            for i, (it, lab, topic) in enumerate(cands[:8]):
                 score_, fa = rated.get(i, (0, ""))
                 if score_ >= 8:
-                    chosen.append((it, lab, fa or it["title"]))
+                    chosen.append((it, lab, fa or it["title"], topic))
         except Exception as e:
             log(f"anthropic: {type(e).__name__} — using keyword mode")
-            chosen = [(it, lab, it["title"]) for it, lab in cands]
+            chosen = [(it, lab, it["title"], topic) for it, lab, topic in cands]
     else:
-        chosen = [(it, lab, it["title"]) for it, lab in cands]
+        chosen = [(it, lab, it["title"], topic) for it, lab, topic in cands]
     chosen = chosen[:2]
+    if evaluated is None:
+        posted = {id(c[0]) for c in chosen}
+        evaluated = [c for c in cands if id(c[0]) in posted]  # keyword mode: anything not posted now stays eligible next run
 
-    for it, lab, text in chosen:
+    for it, lab, text, topic in chosen:
         msg = (f"🚨 <b>خبر فوری — {esc(lab)}</b>\n{esc(text)}\n🔗 <a href=\"{esc(it['link'])}\">{esc(it['src'])}</a>\n\n"
                "⚠️ خبر تازه است و ممکن است هنوز تأیید کامل نشده باشد؛ نوسان شدید محتمل است.")
         tg_send(CHANNEL_ID, msg, dry)
     if not dry:
-        for it, lab in cands:  # remember everything we looked at so it is never re-evaluated
-            seen.append({"title": it["title"], "t": now_utc.timestamp()})
+        posted_topics = {c[3] for c in chosen}
+        for it, lab, topic in evaluated:  # remember what was judged so it is never judged again
+            seen.append({"title": it["title"], "t": now_utc.timestamp(), "topic": topic if topic in posted_topics else ""})
         os.makedirs(os.path.dirname(BREAKING_PATH), exist_ok=True)
         with open(BREAKING_PATH, "w", encoding="utf-8") as f:
             json.dump(seen, f, ensure_ascii=False)
