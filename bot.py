@@ -655,6 +655,56 @@ def llm_rate(cands):
     return out
 
 
+def translate_fa(text):
+    """English -> Persian. Google's free web endpoint first, MyMemory as backup. Returns None if both fail."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        r = http_get("https://translate.googleapis.com/translate_a/single",
+                     params={"client": "gtx", "sl": "en", "tl": "fa", "dt": "t", "q": text}, timeout=20)
+        if r.status_code == 200:
+            out = "".join(seg[0] for seg in r.json()[0] if seg and seg[0]).strip()
+            if out:
+                return out
+        else:
+            log(f"translate google: HTTP {r.status_code}")
+    except Exception as e:
+        log(f"translate google: {type(e).__name__}")
+    try:
+        r = http_get("https://api.mymemory.translated.net/get", params={"q": text[:480], "langpair": "en|fa"}, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            out = str(j.get("responseData", {}).get("translatedText", "")).strip()
+            if out and str(j.get("responseStatus")) == "200" and "MYMEMORY WARNING" not in out.upper():
+                return out
+        log(f"translate mymemory: HTTP {r.status_code}")
+    except Exception as e:
+        log(f"translate mymemory: {type(e).__name__}")
+    return None
+
+
+def short_summary(item):
+    """First sentence of the feed description (if it adds something beyond the title), max ~220 characters."""
+    d = re.split(r"\bThe post\b|appeared first on", item.get("desc", "") or "")[0].strip()
+    if len(d) < 40 or same_story(item["title"], d):
+        return ""
+    first = re.split(r"(?<=[.!?])\s", d)[0]
+    return first[:220].rstrip(" ,;:")
+
+
+def persian_news(item, text):
+    """-> (title_fa, summary_fa, machine_translated?)"""
+    if re.search(r"[\u0600-\u06FF]", text):  # already Persian (written by Claude)
+        return text, "", False
+    title_fa = translate_fa(text)
+    if not title_fa:
+        return text, "", False  # translation unavailable: keep the English headline
+    summ = short_summary(item)
+    summ_fa = translate_fa(summ) if summ else ""
+    return title_fa, summ_fa or "", True
+
+
 BREAKING_PATH = "state/breaking_seen.json"
 
 
@@ -708,8 +758,12 @@ def run_breaking(dry=False):
         evaluated = [c for c in cands if id(c[0]) in posted]  # keyword mode: anything not posted now stays eligible next run
 
     for it, lab, text, topic in chosen:
-        msg = (f"🚨 <b>خبر فوری — {esc(lab)}</b>\n{esc(text)}\n🔗 <a href=\"{esc(it['link'])}\">{esc(it['src'])}</a>\n\n"
-               "⚠️ خبر تازه است و ممکن است هنوز تأیید کامل نشده باشد؛ نوسان شدید محتمل است.")
+        title_fa, summ_fa, machine = persian_news(it, text)
+        msg = (f"🚨 <b>خبر فوری — {esc(lab)}</b>\n{esc(title_fa)}\n"
+               + (f"{esc(summ_fa)}\n" if summ_fa else "")
+               + f"🔗 منبع: <a href=\"{esc(it['link'])}\">{esc(it['src'])}</a>"
+               + ("  •  🌐 ترجمه خودکار" if machine else "")
+               + "\n\n⚠️ خبر تازه است و ممکن است هنوز تأیید کامل نشده باشد؛ نوسان شدید محتمل است.")
         tg_send(CHANNEL_ID, msg, dry)
     if not dry:
         posted_topics = {c[3] for c in chosen}
@@ -767,6 +821,8 @@ def diagnose():
     items = []
     for u in CRYPTO_FEEDS + FOREX_FEEDS:
         items += parse_feed(u, datetime.now(timezone.utc) - timedelta(hours=24))
+    t = translate_fa("Exchange hacked, millions of dollars stolen from hot wallet")
+    print(f"RESULT translate: {'OK -> ' + t if t else 'FAILED (headlines will stay in English)'}")
     hits = [i for i in items if breaking_label(i)]
     print(f"RESULT news: {len(items)} items in last 24h, {len(hits)} look like breaking news")
     for i in hits[:10]:
