@@ -20,7 +20,7 @@ permissions:
   contents: write   # lets the job save state/state.json; these commits also keep the repository "active"
 
 concurrency:
-  group: scheduled-posts
+  group: channel-posts   # shared with breaking.yml: only one job posts to the channel at a time
   cancel-in-progress: false
 
 jobs:
@@ -36,6 +36,13 @@ jobs:
           cache: pip
 
       - run: pip install -r requirements.txt
+
+      # remembers when the last channel post was sent (one post per minute, also across workflows)
+      - uses: actions/cache@v4
+        with:
+          path: state/last_post.json
+          key: lastpost-${{ github.run_id }}
+          restore-keys: lastpost-
 
       - name: Run bot
         env:
