@@ -1,26 +1,29 @@
-name: Breaking news check
+name: Breaking news and Trump posts check
 
 on:
   schedule:
-    # every 10 minutes, at odd minutes (GitHub is less congested than at :00 / :30)
-    - cron: "7,17,27,37,47,57 * * * *"
+    # backup only: the Cloudflare Worker starts this workflow every 10 minutes; GitHub's own timer runs hourly in case that ever stops
+    - cron: "47 * * * *"
   workflow_dispatch:
     inputs:
       mode:
         description: "check (post for real) | dry (print only, post nothing)"
         default: "dry"
+      window_min:
+        description: "minutes back to look for Trump posts (empty = 90). For a test use 2880 to see the last two days"
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: breaking-news
+  group: channel-posts   # shared with bot.yml: only one job posts to the channel at a time
   cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12   # several posts are sent one minute apart
     steps:
       - uses: actions/checkout@v4
 
@@ -31,10 +34,19 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # remembers which stories were already seen, so nothing is posted twice
+      # remembers when the last channel post was sent (one post per minute, also across workflows)
       - uses: actions/cache@v4
         with:
-          path: state/breaking_seen.json
+          path: state/last_post.json
+          key: lastpost-${{ github.run_id }}
+          restore-keys: lastpost-
+
+      # remembers which stories and which Trump posts were already seen, so nothing is posted twice
+      - uses: actions/cache@v4
+        with:
+          path: |
+            state/breaking_seen.json
+            state/trump_seen.json
           key: breaking-${{ github.run_id }}
           restore-keys: breaking-
 
@@ -43,6 +55,11 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TRUMP_WINDOW_MIN: ${{ github.event.inputs.window_min || vars.TRUMP_WINDOW_MIN }}
+          TRUMP_MIN_SCORE: ${{ vars.TRUMP_MIN_SCORE }}
+          TRUMP_MAX_PER_DAY: ${{ vars.TRUMP_MAX_PER_DAY }}
+          TRUMP_FEED_URL: ${{ vars.TRUMP_FEED_URL }}
+          TRUMP_SHOW_ORIGINAL: ${{ vars.TRUMP_SHOW_ORIGINAL }}
           INPUT_MODE: ${{ github.event.inputs.mode }}
         run: |
           if [ "${INPUT_MODE:-check}" = "dry" ]; then
