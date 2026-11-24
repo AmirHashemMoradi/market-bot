@@ -474,7 +474,8 @@ def build_prices_message(now, state):
 
 
 # ----------------------------------------------------------------------------- economic calendar
-FF_URLS = ["https://nfs.faireconomy.media/ff_calendar_thisweek.json", "https://nfs.faireconomy.media/ff_calendar_nextweek.json"]
+FF_HOSTS = ["https://nfs.faireconomy.media", "https://cdn-nfs.faireconomy.media"]  # same data, second address as a backup
+FF_FILES = ["ff_calendar_thisweek.json", "ff_calendar_nextweek.json"]
 
 FA_EVENTS = [
     (r"Federal Funds Rate", "تصمیم نرخ بهره فدرال رزرو آمریکا"),
@@ -524,27 +525,32 @@ def fa_event(title):
 
 def fetch_events():
     events = []
-    for url in FF_URLS:
-        for attempt in (1, 2):
-            try:
-                r = http_get(url)
-                if r.status_code == 429 and attempt == 1:
-                    time.sleep(8)
-                    continue
-                if r.status_code != 200:
-                    log(f"forexfactory {url.rsplit('/', 1)[-1]}: HTTP {r.status_code}")
-                    break
-                data = r.json()
-                log(f"forexfactory {url.rsplit('/', 1)[-1]}: {len(data)} events")
-                for e in data:
-                    try:
-                        dt = datetime.fromisoformat(e["date"])
-                    except Exception:
+    for fname in FF_FILES:
+        got = False
+        for host in FF_HOSTS:
+            for attempt in (1, 2):
+                try:
+                    r = http_get(f"{host}/{fname}")
+                    if r.status_code == 429 and attempt == 1:
+                        time.sleep(8)
                         continue
-                    events.append({"title": e.get("title", ""), "cur": e.get("country", ""), "impact": e.get("impact", ""), "dt": dt})
-                break
-            except Exception as ex:
-                log(f"forexfactory {url.rsplit('/', 1)[-1]}: {type(ex).__name__}")
+                    if r.status_code != 200:
+                        log(f"forexfactory {host.split('//')[1].split('.')[0]}/{fname}: HTTP {r.status_code}")
+                        break
+                    data = r.json()
+                    log(f"forexfactory {fname}: {len(data)} events")
+                    for e in data:
+                        try:
+                            dt = datetime.fromisoformat(e["date"])
+                        except Exception:
+                            continue
+                        events.append({"title": e.get("title", ""), "cur": e.get("country", ""), "impact": e.get("impact", ""), "dt": dt})
+                    got = True
+                    break
+                except Exception as ex:
+                    log(f"forexfactory {fname}: {type(ex).__name__}")
+                    break
+            if got:
                 break
     return events
 
@@ -559,7 +565,11 @@ def build_calendar_message(now, hours=24, events=None):
         key=lambda e: e["dt"],
     )[:10]
     if not picked:
-        return None
+        return (
+            "🗓 <b>تقویم ریسک امروز</b>\n\n"
+            "✅ در ۲۴ ساعت آینده خبر پرریسک اقتصادی از آمریکا، اروپا و انگلیس ثبت نشده است.\n"
+            "با این حال، نوسان ناگهانی همیشه ممکن است."
+        )
     lines = ["🗓 <b>تقویم ریسک امروز؛ انتشار داده‌های اقتصادی آمریکا و اروپا</b>", ""]
     for e in picked:
         t = e["dt"].astimezone(TEHRAN)
@@ -1055,6 +1065,43 @@ def pick_slot(arg, now):
     return best[1], best[2]
 
 
+CAL_RETRY_FIRST = (7, 30)   # Tehran time of the first retry
+CAL_RETRY_LAST = (10, 0)    # no attempt after this time
+
+
+def run_calendar_retry(dry=False):
+    """Started at 07:30, 08:00 ... 10:00 Tehran (by the Cloudflare timer): posts today's calendar if it is still missing."""
+    now = datetime.now(TEHRAN)
+    today = f"{now:%Y-%m-%d}"
+    state = load_state()
+    if state.get("calendar_date") == today:
+        print("calendar retry: today's calendar was already posted — nothing to do")
+        return 0
+    hm = (now.hour, now.minute)
+    if hm < CAL_RETRY_FIRST or hm > (CAL_RETRY_LAST[0], CAL_RETRY_LAST[1] + 5):  # +5 minutes: GitHub may start a little late
+        print(f"calendar retry: {now:%H:%M} Tehran is outside 07:30-10:00 — no more attempts until tomorrow")
+        return 0
+    final = hm >= (9, 55)
+    try:
+        text = build_calendar_message(now)
+        if text:
+            channel_send(text, dry)
+            if not dry:
+                state["calendar_date"] = today
+                state["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                save_state(state)
+            print("calendar retry: posted")
+        return 0
+    except Exception as e:
+        print(f"calendar retry failed ({now:%H:%M}): {type(e).__name__}: {str(e)[:120]}")
+        if final and not dry and OWNER_ID and BOT_TOKEN:  # tell the owner only after the last attempt
+            try:
+                tg_send(OWNER_ID, "⚠️ <b>تقویم امروز تا ساعت ۱۰ هم منتشر نشد</b>\n" + esc(f"{type(e).__name__}: {str(e)[:120]}"), False)
+            except Exception:
+                pass
+        return 1 if final else 0  # only the last attempt shows a red mark in GitHub (no e-mail noise for each retry)
+
+
 def diagnose():
     print("== diagnose ==")
     print(f"secrets: BOT_TOKEN={'set' if BOT_TOKEN else 'MISSING'} CHANNEL_ID={'set' if CHANNEL_ID else 'MISSING'} "
@@ -1067,6 +1114,9 @@ def diagnose():
         print(f"RESULT {k}: {'FAILED' if not v else f'{fmt(v.toman)} toman via {v.source}' + (' (approx)' if v.approx else '')}")
     ev = fetch_events()
     print(f"RESULT events: {len(ev)} fetched, high-impact USD/EUR/GBP: {len([e for e in ev if e['impact']=='High' and e['cur'] in EVENT_CURRENCIES])}")
+    nowt = datetime.now(TEHRAN)
+    soon = [e for e in ev if e["impact"] == "High" and e["cur"] in EVENT_CURRENCIES and nowt <= e["dt"].astimezone(TEHRAN) <= nowt + timedelta(hours=24)]
+    print(f"RESULT calendar: {len(soon)} high-impact events in the next 24 hours" + (" (a 'no big events' note would be posted)" if not soon and ev else ""))
     items = []
     for u in CRYPTO_FEEDS + FOREX_FEEDS:
         items += parse_feed(u, datetime.now(timezone.utc) - timedelta(hours=24))
@@ -1121,6 +1171,9 @@ def main():
                 print(f"ERROR {name}:", type(e).__name__, str(e)[:150])
         return 1 if failed == 2 else 0
 
+    if a.slot == "cal":
+        return run_calendar_retry(a.dry_run)
+
     now = datetime.now(TEHRAN)
     slot, target = pick_slot(a.slot, now)
     if a.slot == "auto" and not a.dry_run:
@@ -1154,16 +1207,19 @@ def main():
         if not dry:
             state["prices"] = new
 
+    today = f"{now:%Y-%m-%d}"
+
     def do_calendar():
         text = build_calendar_message(now)
         if text:
             channel_send(text, dry)
-        else:
-            print("calendar: no high-impact USD/EUR/GBP events today — nothing posted")
+            if not dry:
+                state["calendar_date"] = today
 
     if a.only in (None, "prices"):
         run("prices", do_prices)
-    if a.only == "calendar" or (a.only is None and slot in (7, None)):  # calendar: once a day, at 07:00
+    # calendar: once a day at 07:00 (if it fails, the retries below run between 07:30 and 10:00)
+    if a.only == "calendar" or (a.only is None and slot in (7, None)):
         run("calendar", do_calendar)
 
     if errors and not dry and OWNER_ID and BOT_TOKEN:
